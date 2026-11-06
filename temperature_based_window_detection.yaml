@@ -1,198 +1,121 @@
-blueprint:
-  name: Temperaturbasierte Fenstererkennung
-  description: >
-    Erkennt ein vermutlich geöffnetes Fenster anhand eines schnellen Abfalls
-    der Raumtemperatur (Derivative-Sensor), schaltet das Thermostat aus und
-    stellt beim vermuteten Schließen den zuvor gespeicherten Climate-Zustand
-    wieder her. Optional wird alarmiert, wenn die Temperatur nach einer
-    Wartezeit weiter fällt.
-
-    Benötigt pro Raum einen Derivative-Helfer (Einheit °C/min) und einen
-    input_boolean-Helfer als Fensterstatus. Die Erkennung ist eine Näherung:
-    allein anhand der Temperatur lässt sich ein geschlossenes Fenster nicht
-    sicher von einer stabilisierten Raumtemperatur unterscheiden.
-  domain: automation
-  input:
-    climate_entity:
-      name: Thermostat
-      selector:
-        entity:
-          filter:
-            - domain: climate
-
-    temperature_sensor:
-      name: Raumtemperatursensor
-      selector:
-        entity:
-          filter:
-            - domain: sensor
-              device_class: temperature
-
-    derivative_sensor:
-      name: Temperaturänderung (Derivative-Helfer)
-      description: Derivative-Sensor in °C/min.
-      selector:
-        entity:
-          filter:
-            - domain: sensor
-
-    window_open_helper:
-      name: Fensterstatus (input_boolean)
-      description: Wird bei erkannter Öffnung eingeschaltet und beim Schließen ausgeschaltet.
-      selector:
-        entity:
-          filter:
-            - domain: input_boolean
-
-    opening_gradient:
-      name: Öffnungsschwelle
-      description: Öffnung wird erkannt, wenn die Änderungsrate länger als die Bestätigungszeit darunter liegt.
-      default: -0.5
-      selector:
-        number:
-          min: -5
-          max: 0
-          step: 0.05
-          unit_of_measurement: "°C/min"
-          mode: box
-
-    opening_confirmation:
-      name: Öffnung bestätigen nach
-      default: 2
-      selector:
-        number:
-          min: 0
-          max: 15
-          step: 1
-          unit_of_measurement: min
-          mode: box
-
-    closing_gradient:
-      name: Schließschwelle
-      description: Vermutetes Schließen, sobald die Änderungsrate länger als die Bestätigungszeit wieder darüber liegt.
-      default: -0.05
-      selector:
-        number:
-          min: -2
-          max: 2
-          step: 0.05
-          unit_of_measurement: "°C/min"
-          mode: box
-
-    closing_confirmation:
-      name: Schließen bestätigen nach
-      default: 8
-      selector:
-        number:
-          min: 1
-          max: 60
-          step: 1
-          unit_of_measurement: min
-          mode: box
-
-    alarm_delay:
-      name: Wartezeit bis zur Alarmprüfung
-      default: 10
-      selector:
-        number:
-          min: 1
-          max: 180
-          step: 1
-          unit_of_measurement: min
-          mode: box
-
-    alarm_temperature_drop:
-      name: Weiterer Temperaturabfall für Alarm
-      description: Alarm wird ausgelöst, wenn die Temperatur seit Erkennung der Öffnung mindestens um diesen Wert weiter gefallen ist.
-      default: 1
-      selector:
-        number:
-          min: 0.1
-          max: 10
-          step: 0.1
-          unit_of_measurement: "°C"
-          mode: box
-
-    alarm_action:
-      name: Alarmaktion
-      description: Zum Beispiel Push-Nachricht, Licht einschalten oder Sprachausgabe.
-      selector:
-        action: {}
-
-mode: restart
-max_exceeded: silent
-
-trigger:
-  - platform: numeric_state
-    entity_id: !input derivative_sensor
-    below: !input opening_gradient
-    for:
-      minutes: !input opening_confirmation
-    id: window_open
-
+    id: opening_start
   - platform: numeric_state
     entity_id: !input derivative_sensor
     above: !input closing_gradient
-    for:
-      minutes: !input closing_confirmation
-    id: window_closed
+    id: closing_start
 
 action:
   - variables:
       climate_entity: !input climate_entity
-      temperature_entity: !input temperature_sensor
-      alarm_delay_minutes: !input alarm_delay
-      alarm_drop: !input alarm_temperature_drop
-      scene_id: "window_detection_{{ climate_entity.split('.')[1] | replace('-', '_') }}"
-      opening_temperature: "{{ states(temperature_entity) | float(0) }}"
-
+      temperature_sensor: !input temperature_sensor
+      derivative_sensor: !input derivative_sensor
+      window_open_helper: !input window_open_helper
+      reference_temperature_helper: !input reference_temperature_helper
+      opening_gradient: !input opening_gradient
+      minimum_temperature_drop: !input minimum_temperature_drop
+      closing_gradient: !input closing_gradient
+      alarm_enabled: !input alarm_enabled
+      alarm_temperature_drop: !input alarm_temperature_drop
+      alarm_gradient: !input alarm_gradient
+      alarm_action: !input alarm_action
+      restore_scene_id: !input restore_scene_id
   - choose:
       - conditions:
           - condition: trigger
-            id: window_open
+            id: opening_start
           - condition: state
             entity_id: !input window_open_helper
             state: "off"
         sequence:
+          # Ausgangstemperatur zu Beginn der Erkennungsphase sichern.
+          - service: input_number.set_value
+            target:
+              entity_id: !input reference_temperature_helper
+            data:
+              value: "{{ states(temperature_sensor) | float(0) }}"
+          - delay:
+              seconds: !input opening_confirmation_seconds
+          # Gradient muss noch negativ genug sein und die Mindestdifferenz
+          # muss seit Beginn der Erkennungsphase erreicht worden sein.
+          - condition: template
+            value_template: >
+              {% set t = states(temperature_sensor) | float(0) %}
+              {% set ref = states(reference_temperature_helper) | float(0) %}
+              {% set g = states(derivative_sensor) | float(0) %}
+              {{ (ref - t) >= (minimum_temperature_drop | float)
+                 and g <= (opening_gradient | float) }}
+          # Vor dem Ausschalten den vollständigen Climate-Zustand sichern.
           - service: scene.create
             data:
-              scene_id: "{{ scene_id }}"
+              scene_id: !input restore_scene_id
               snapshot_entities:
                 - !input climate_entity
-
-          - service: input_boolean.turn_on
-            target:
-              entity_id: !input window_open_helper
-
           - service: climate.turn_off
             target:
               entity_id: !input climate_entity
-
-          - delay:
-              minutes: "{{ alarm_delay_minutes | int }}"
-
-          - condition: state
-            entity_id: !input window_open_helper
-            state: "on"
-
-          - condition: template
-            value_template: >
-              {{ states(temperature_entity) | float(0)
-                 <= opening_temperature | float(0) - alarm_drop | float(0) }}
-
-          - sequence: !input alarm_action
+          - service: input_boolean.turn_on
+            target:
+              entity_id: !input window_open_helper
+          # Referenz für die weitere Abkühlungs-/Alarmprüfung neu setzen.
+          - service: input_number.set_value
+            target:
+              entity_id: !input reference_temperature_helper
+            data:
+              value: "{{ states(temperature_sensor) | float(0) }}"
+          # Während das Fenster als offen gilt, regelmäßig weiter prüfen.
+          - repeat:
+              while:
+                - condition: state
+                  entity_id: !input window_open_helper
+                  state: "on"
+              sequence:
+                - delay:
+                    seconds: !input alarm_check_interval_seconds
+                - choose:
+                    - conditions:
+                        - condition: template
+                          value_template: >
+                            {{ is_state(window_open_helper, 'on')
+                               and (states(temperature_sensor) | float(0))
+                                 <= ((states(reference_temperature_helper) | float(0))
+                                     - (alarm_temperature_drop | float))
+                               and (states(derivative_sensor) | float(0))
+                                 <= (alarm_gradient | float) }}
+                        - condition: template
+                          value_template: "{{ alarm_enabled }}"
+                      sequence:
+                        - choose:
+                            - conditions:
+                                - condition: template
+                                  value_template: "{{ alarm_action | length > 0 }}"
+                              sequence: !input alarm_action
+                        # Neue Referenz, damit ein weiterer Alarm erst nach
+                        # einem erneuten zusätzlichen Temperaturabfall erfolgt.
+                        - service: input_number.set_value
+                          target:
+                            entity_id: !input reference_temperature_helper
+                          data:
+                            value: "{{ states(temperature_sensor) | float(0) }}"
 
       - conditions:
           - condition: trigger
-            id: window_closed
+            id: closing_start
           - condition: state
             entity_id: !input window_open_helper
             state: "on"
         sequence:
+          - delay:
+              seconds: !input closing_confirmation_seconds
+          - condition: state
+            entity_id: !input window_open_helper
+            state: "on"
+          - condition: template
+            value_template: >
+              {{ states(derivative_sensor) | float(-99)
+                 >= (closing_gradient | float) }}
           - service: scene.turn_on
             target:
-              entity_id: "{{ 'scene.' ~ scene_id }}"
-
+              entity_id: "{{ 'scene.' ~ restore_scene_id }}"
           - service: input_boolean.turn_off
             target:
               entity_id: !input window_open_helper
